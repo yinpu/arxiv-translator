@@ -1,45 +1,74 @@
-# 编译错误速查
+# 本地编译错误速查
 
-## 常见错误与修复
+## 读取日志
 
-**字体未找到** `Font "XXX" not found`
-→ 请求的 CJK 字体在远程服务器上不存在。改用已确认可用的字体：`Noto Serif CJK SC`（已在 latex.ytotech.com 验证）。
+脚本会在 stderr 打印构建目录和完整日志路径：
 
-**宏包冲突**（`fontenc` 或 `inputenc`）
-→ 注释掉 `\usepackage[T1]{fontenc}` 和 `\usepackage[utf8]{inputenc}`——XeLaTeX / LuaLaTeX 的 Unicode 编译栈原生支持 UTF-8，通常不需要这两个包。
+- `$WORK_DIR/.arxiv-build/run-*/attempt-*.log`：latexmk、LaTeX 和文献工具的完整输出。
+- `attempt-*/<主文件名>.log`：该次构建的最终 LaTeX 日志。
+- `attempt-*/<主文件名>.blg`：BibTeX/Biber 日志（如运行）。
 
-**宏重复定义** `LaTeX Error: Command \xxx already defined`
-→ 常见于为中文支持引入 `luatexja` 后，与论文源码里的 `\newcommand\xxx...` 冲突。优先把源码中的该行从 `\newcommand` 改为 `\renewcommand`（保留论文作者期望的宏定义）。
+先处理第一个 `!` 错误或 `文件:行号:` 报错，后续错误通常是连锁反应。失败不会覆盖已有目标 PDF，源码与日志默认保留。脚本从构建副本运行，修复应写回 `$WORK_DIR` 中对应文件。
 
-**编译“成功”但引用/交叉引用仍是问号**（PDF 里出现 `??` 或 `[?]`）
-→ 这通常意味着编译过程里发生了 LaTeX 错误，但在 `nonstopmode` 下仍生成了 PDF，导致 `latexmk` 没能完成多次编译而解析引用/交叉引用。
-→ 解决思路：开启 `-halt-on-error`（让错误直接失败并返回日志）并修复首个报错后重试。
-→ 若论文自带 `.bbl`，优先把 `.bbl` 内容内联到 `\bibliography{...}` 位置；不要再向 latex-on-http 发送 `options.bibliography`，该字段已被上游 API 移除。
+## 缺少本地工具
 
-**宏包缺失** `File 'xxx.sty' not found`
-→ 该包未安装在远程服务器上。可在 `https://latex.ytotech.com/packages` 查询可用包列表。若缺失，尝试注释掉该包或替换为等价的可用包。
+`Missing local tool: latexmk` / `lualatex` / `xelatex`：安装完整 TeX Live。macOS 使用：
 
-**中文溢出 / Overfull \hbox**
-→ preamble 中已包含 `\setlength{\emergencystretch}{3em}`，通常足够。若仍溢出，添加 `\sloppy`。
-
-**参考文献问题（bibtex/biber）**
-→ 确认 `.bib` 文件已存在于工作目录并被正确引用；若论文自带 `.bbl`，优先内联 `.bbl`，让远端单遍编译也能解析引用。
-→ 如果 `.bbl` 已被内联，可将 `options.compiler.bibliography` 设为 `false`，避免远端再次运行 BibTeX。
-
-**PDF 文本提取出现 `�`**
-→ 使用 pypdf 提取 CJK PDF 时出现 `�` 不一定是 PDF 缺字；FakeSlant 等字体特性可能影响 ToUnicode 回查。优先用 PyMuPDF 提取文本，或将页面渲染成 PNG 后目视检查。
-
-**远端编译超时 / 变慢**
-→ 检查工作目录里是否混入了历史产物（尤其是无关的 PDF、`.aux`、`.log`、旧输出文件）。这些文件会被一并上传，显著拖慢远端编译，甚至导致超时。
-
-## 读取错误日志
-
-编译失败时，服务端返回含完整日志的 JSON。找到以 `!` 开头的行定位致命错误：
-
-```
-! LaTeX Error: ...
-! Undefined control sequence ...
-! Missing $ inserted ...
+```bash
+brew install --cask mactex-no-gui
 ```
 
-优先修复第一个错误——后续错误通常是连锁反应。
+脚本优先查找 PATH，并自动兼容 `/Library/TeX/texbin`。不要改用远程服务。
+
+## 字体未找到或 PDF 缺字
+
+`Font "XXX" not found` / `Missing character:`：源码指定的字体未在本机安装，或不包含所需字符。
+
+自动注入的中文配置使用 TeX Live 自带的 Fandol，可检查：
+
+```bash
+kpsewhich FandolSong-Regular.otf
+kpsewhich FandolHei-Regular.otf
+kpsewhich FandolFang-Regular.otf
+```
+
+若命令不在 PATH，macOS 用 `/Library/TeX/texbin/kpsewhich`。已有中文字体配置不会自动替换；确认字体意图后安装所需字体或调整为可用字体。罕见汉字可能超出 Fandol 字库，需要另选覆盖相应字符的字体。PDF 文本提取乱码不一定是缺字，可用 `pdftoppm -png <PDF> <输出前缀>` 渲染检查。
+
+## 宏包缺失
+
+`File 'xxx.sty' not found`：先检查该文件是否是论文自带文件、相对路径是否正确，再用 `kpsewhich xxx.sty` 查询本地安装。TeX Live 可使用 `tlmgr search --global --file '/xxx.sty'` 查找所属包，并用 `tlmgr install <包名>` 安装。系统级安装可能需要管理员权限。安装依赖需要联网，编译本身不联网。
+
+不要仅为通过编译而随意删除宏包，它可能影响公式和排版。
+
+## 编码宏包冲突
+
+XeLaTeX/LuaLaTeX 的 Unicode 编译栈原生支持 UTF-8。脚本会注释主文件里独立声明的 `inputenc` / `fontenc`；若声明混在多个宏包中、或藏在模板文件里，按具体错误修复，保留其他宏包。
+
+## 宏重复定义
+
+`LaTeX Error: Command \xxx already defined`：常见于 `luatexja` 和论文宏冲突。脚本只针对日志指出的宏，将源码中的 `\newcommand` 改为 `\renewcommand`，最多自动重试两次。其他错误需根据日志处理，不要无限重试。
+
+## 引用未解析与参考文献
+
+脚本使用 `latexmk` 多轮编译，并检查最终日志。未定义的引用、仍需重跑的标签和缺字会导致交付失败，即使引擎已生成 PDF。
+
+- 有普通 BibTeX `.bbl`：优先内联预置文献，避免缺少 `.bib` 时无法生成引用。
+- 只有 `.bib`：确认 `\bibliography`、`\bibliographystyle` 和引用键正确，由 latexmk 调用 BibTeX。
+- biblatex：确认 `\addbibresource` 指向正确文件，通常由 Biber 处理。预置 `.bbl` 且 `.bib` 缺失时禁用文献重生成，保护原始 `.bbl`；若 `.bbl` 与本机 biblatex 版本不兼容，需要匹配版本或补齐 `.bib`。
+- `??` / `[?]`：检查引用键、标签拼写以及首个编译错误，不要把 PDF 中合法的问号文本当成引用错误。
+
+## 图片或章节找不到
+
+编译以 `WORK_DIR` 为根目录，`MAIN_TEX` 保留相对路径。图片和 `\input` 路径应相对该根目录。如果项目的相对路径原本基于主文件所在目录，请将该目录作为 `WORK_DIR`。所有 PDF 图片都会复制到构建目录，不会根据文件名猜测并删除。
+
+## 超时或编译缓慢
+
+每次 latexmk 调用最多 300 秒，超时后会停止编译进程；macOS/Linux 同时终止它启动的子进程。查看日志末尾，区分首次字体缓存生成、复杂图形和源码循环。构建副本默认保留，确认不再需要后随 `.tmp_arxiv` 一并清理。
+
+## 模板依赖 shell escape 或 latexmk 配置
+
+脚本不加载 latexmk 配置文件，并显式关闭 shell escape。涉及 minted、外部图形转换等流程时，先单独生成所需资源，再本地编译；不要自动启用源码附带的任意命令。
+
+## 中文溢出
+
+根据实际版面，在 preamble 添加 `\setlength{\emergencystretch}{3em}` 并检查长 URL、表格列宽和不可断行内容；必要时局部使用 `\sloppy`，重新渲染确认排版。

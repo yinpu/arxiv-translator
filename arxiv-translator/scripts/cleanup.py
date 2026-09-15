@@ -41,7 +41,8 @@ def backup_translated_sources(tmp_dir, backup_dir):
 
     backup_dir = os.path.abspath(backup_dir)
     os.makedirs(backup_dir, exist_ok=True)
-    for root, _, files in os.walk(tmp_dir):
+    for root, dirs, files in os.walk(tmp_dir):
+        dirs[:] = [name for name in dirs if name != ".arxiv-build"]
         for fname in files:
             if os.path.splitext(fname)[1].lower() not in BACKUP_EXTS:
                 continue

@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-Submit a LaTeX project to latex-on-http for compilation.
+Compile a LaTeX project locally with latexmk (no network access).
 Usage: python compile.py <work_dir> <main_tex> <output_pdf_path>
 
 main_tex: path relative to work_dir (e.g. ms.tex), or absolute path to the main file.
 output_pdf_path: full path for the output PDF; if an existing directory is passed, write <main_basename>.pdf there.
 """
-import base64
 import os
 import re
 import sys
+import shutil
+import signal
+import subprocess
+import tempfile
+from pathlib import Path
 
-import requests
 
-
-_BIBLATEX_RE = re.compile(r"\\(?:usepackage(?:\[[^\]]*\])?\{biblatex\}|addbibresource\{)")
 _BIBTEX_CMD_RE = re.compile(r"(?P<indent>^[ \t]*)\\bibliography\s*\{(?P<names>[^}]+)\}", re.MULTILINE)
 _THEBIB_RE = re.compile(r"\\begin\{thebibliography\}")
 _BBL_INPUT_RE = re.compile(r"\\(?:input|include)\s*\{[^}]+\.bbl\}")
@@ -25,8 +26,6 @@ _CMD_ALREADY_DEFINED_WITH_PATH_RE = re.compile(
 )
 _BEGIN_DOCUMENT_RE = re.compile(r"\\begin\{document\}")
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
-_UNRESOLVED_CITE_MARKERS = ("[?", "?]")
-_UNRESOLVED_REF_MARKERS = ("??",)
 _SOURCE_TEXT_EXTS = {
     ".tex",
     ".sty",
@@ -58,47 +57,37 @@ _BUILD_ARTIFACT_EXTS = (
     ".ind",
     ".xdv",
     ".dvi",
-    ".ps",
 )
 _SKIP_FILENAMES = {"download.env"}
 _INLINED_BBL_MARKER = "% arxiv-translator: inlined prebuilt .bbl"
-_AUTO_CJK_PREAMBLE = "\n".join(
-    (
-        r"\usepackage{fontspec}",
-        r"\usepackage{luatexja}",
-        r"\usepackage{luatexja-fontspec}",
-        r"\setmainjfont{Noto Serif CJK SC}[%"
-        "\n"
-        r"  BoldFont=Noto Serif CJK SC,AutoFakeBold=2,%"
-        "\n"
-        r"  ItalicFont=Noto Serif CJK SC,ItalicFeatures={FakeSlant=0.2},%"
-        "\n"
-        r"  BoldItalicFont=Noto Serif CJK SC,BoldItalicFeatures={FakeSlant=0.2}%"
-        "\n"
-        r"]",
-        r"\setsansjfont{Noto Sans CJK SC}[%"
-        "\n"
-        r"  BoldFont=Noto Sans CJK SC,AutoFakeBold=2,%"
-        "\n"
-        r"  ItalicFont=Noto Sans CJK SC,ItalicFeatures={FakeSlant=0.2},%"
-        "\n"
-        r"  BoldItalicFont=Noto Sans CJK SC,BoldItalicFeatures={FakeSlant=0.2}%"
-        "\n"
-        r"]",
-        r"\IfFontExistsTF{Iosevka}{\setmonofont{Iosevka}}{}",
-        r"\setmonojfont{Noto Sans Mono CJK SC}[%"
-        "\n"
-        r"  BoldFont=Noto Sans Mono CJK SC,AutoFakeBold=2%"
-        "\n"
-        r"]",
-        "",
-    )
+_AUTO_CJK_PREAMBLE = r"""
+% arxiv-translator: local CJK support (TeX Live Fandol fonts)
+\usepackage{fontspec}
+\usepackage{luatexja}
+\usepackage{luatexja-fontspec}
+\setmainjfont{FandolSong-Regular.otf}[
+  BoldFont=FandolSong-Bold.otf,ItalicFont=FandolKai-Regular.otf,
+  BoldItalicFont=FandolKai-Regular.otf,BoldItalicFeatures={FakeBold=2}]
+\setsansjfont{FandolHei-Regular.otf}[BoldFont=FandolHei-Bold.otf]
+\setmonojfont{FandolFang-Regular.otf}
+"""
+_COMPILE_TIMEOUT = 300
+_BUILD_DIR = ".arxiv-build"
+_PACKAGE_RE = re.compile(r"\\(?:usepackage|RequirePackage)\s*(?:\[[^\]]*\])?\s*\{([^}]+)\}")
+_UNRESOLVED_LOG_RE = re.compile(
+    r"(?:LaTeX|Package \S+) Warning: (?:There were undefined (?:references|citations)|"
+    r"(?:Citation|Reference) [^\n]+ undefined|Label\(s\) may have changed|Please \(re\)run Biber)",
 )
 
 
-def encode(path):
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode()
+def _uncomment(text):
+    # Preserve offsets so matches in active text can be applied to the original.
+    return re.sub(r"(?<!\\)%[^\n]*", lambda m: " " * len(m.group()), text)
+
+
+def _packages(text):
+    return {name.strip() for match in _PACKAGE_RE.finditer(_uncomment(text))
+            for name in match.group(1).split(",")}
 
 
 def _read_text(path):
@@ -115,7 +104,8 @@ def _norm_relpath(path, root):
 
 
 def _iter_project_files(work_dir):
-    for root, _, files in os.walk(work_dir):
+    for root, dirs, files in os.walk(work_dir):
+        dirs[:] = [d for d in dirs if d not in {_BUILD_DIR, ".git", "__pycache__"}]
         for fname in files:
             abs_path = os.path.join(root, fname)
             yield abs_path, _norm_relpath(abs_path, work_dir)
@@ -134,38 +124,25 @@ def _collect_source_texts(work_dir):
 
 
 def _main_tex_relative(work_dir, main_tex):
-    work_dir = os.path.abspath(work_dir)
-    if os.path.isabs(main_tex):
-        main_abs = os.path.abspath(main_tex)
-    else:
-        main_abs = os.path.abspath(os.path.join(work_dir, main_tex))
+    root = Path(work_dir).expanduser().resolve()
+    main = Path(main_tex).expanduser()
+    main = (main if main.is_absolute() else root / main).resolve()
+    if not root.is_dir():
+        raise ValueError(f"work_dir is not a directory: {root}")
     try:
-        rel = os.path.relpath(main_abs, work_dir)
+        rel = main.relative_to(root)
     except ValueError:
-        rel = main_tex
-    if rel.startswith("..") or os.path.isabs(rel):
-        print(
-            "Error: main file must be inside work_dir.\n"
-            f"  work_dir={work_dir}\n"
-            f"  main_tex={main_tex} -> {main_abs}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    rel = os.path.normpath(rel)
-    if os.name == "nt":
-        rel = rel.replace("\\", "/")
-    return work_dir, rel
+        raise ValueError(f"main file must be inside work_dir: {main}") from None
+    if not main.is_file() or main.suffix.lower() != ".tex":
+        raise ValueError(f"main file is not an existing .tex file: {main}")
+    return str(root), rel.as_posix()
 
 
 def _resolve_output_pdf(output_path, main_tex_rel):
-    output_path = os.path.expanduser(output_path)
-    if output_path.endswith(os.sep) or (os.path.exists(output_path) and os.path.isdir(output_path)):
-        base = os.path.splitext(os.path.basename(main_tex_rel))[0] + ".pdf"
-        return os.path.join(output_path.rstrip(os.sep), base)
-    parent = os.path.dirname(os.path.abspath(output_path))
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    return output_path
+    output = Path(output_path).expanduser()
+    if output_path.endswith(os.sep) or output.is_dir():
+        output = output / (Path(main_tex_rel).stem + ".pdf")
+    return str(output.absolute())
 
 
 def _find_prebuilt_bbl(work_dir, main_rel, bibliography_names=None):
@@ -199,11 +176,11 @@ def _split_bibliography_names(raw):
 
 
 def _inline_prebuilt_bbl(work_dir, main_rel):
-    """Inline a shipped .bbl at \bibliography{...} for single-pass remote builds."""
+    """Reuse a shipped classic BibTeX bibliography without regenerating it."""
     source_texts = _collect_source_texts(work_dir)
     tex_blob = "\n".join(text for rel, text in source_texts.items() if rel.lower().endswith(".tex"))
 
-    if _BIBLATEX_RE.search(tex_blob):
+    if "biblatex" in _packages(tex_blob) or "\\addbibresource" in _uncomment(tex_blob):
         return False
     if _THEBIB_RE.search(tex_blob) or _BBL_INPUT_RE.search(tex_blob) or _INLINED_BBL_MARKER in tex_blob:
         return False
@@ -242,42 +219,10 @@ def _inline_prebuilt_bbl(work_dir, main_rel):
 
 
 def _detect_compiler(work_dir, main_rel):
-    main_text = _read_text(os.path.join(work_dir, main_rel))
-
-    # Prefer a compiler that matches the CJK stack used in the document.
-    # This avoids subtle incompatibilities and also reduces macro conflicts.
-    if "\\usepackage{xeCJK}" in main_text or "\\setCJKmainfont" in main_text:
+    text = _uncomment(_read_text(os.path.join(work_dir, main_rel)))
+    if "xeCJK" in _packages(text) or "\\setCJKmainfont" in text:
         return "xelatex"
-    if "\\usepackage{luatexja}" in main_text or "\\usepackage{luatexja-fontspec}" in main_text or "\\setmainjfont" in main_text:
-        return "lualatex"
-
-    # Default for this skill: lualatex (works well with fontspec and many arXiv sources).
     return "lualatex"
-
-
-def _map_server_path_to_local(server_path, main_rel):
-    # latex-on-http renames the main file to __main_document__.tex
-    base = os.path.basename(server_path)
-    if base == "__main_document__.tex":
-        return main_rel
-    return server_path.lstrip("./")
-
-
-def _patch_file_replace(path, pattern, repl, count=1):
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            text = f.read()
-    except OSError:
-        return False
-    new_text, n = re.subn(pattern, repl, text, count=count, flags=re.MULTILINE)
-    if n <= 0:
-        return False
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(new_text)
-    except OSError:
-        return False
-    return True
 
 
 def _project_contains_cjk(work_dir):
@@ -298,30 +243,22 @@ def _ensure_cjk_support(work_dir, main_rel):
     if not _project_contains_cjk(work_dir):
         return False
 
-    # Respect an existing CJK/Unicode stack if the paper already has one.
-    if any(
-        tok in text
-        for tok in (
-            "\\usepackage{luatexja}",
-            "\\usepackage{luatexja-fontspec}",
-            "\\usepackage{xeCJK}",
-            "\\usepackage{ctex}",
-            "\\setmainjfont{",
-            "\\setCJKmainfont{",
-        )
-    ):
+    # Respect existing CJK support, including package options and ctex classes.
+    active_text = _uncomment(text)
+    if (_packages(text) & {"luatexja", "luatexja-fontspec", "xeCJK", "ctex", "CJK", "CJKutf8"}
+            or re.search(r"\\documentclass(?:\[[^\]]*\])?\{ctex[^}]*\}", active_text)
+            or any(tok in active_text for tok in ("\\setmainjfont{", "\\setCJKmainfont{"))):
         return False
 
-    if not _BEGIN_DOCUMENT_RE.search(text):
+    begin = _BEGIN_DOCUMENT_RE.search(active_text)
+    if not begin:
         return False
 
     preamble = _AUTO_CJK_PREAMBLE
-    if "\\usepackage{fontspec}" in text:
+    if "fontspec" in _packages(text):
         preamble = preamble.replace("\\usepackage{fontspec}\n", "", 1)
 
-    new_text, n = _BEGIN_DOCUMENT_RE.subn(lambda _: preamble + r"\begin{document}", text, count=1)
-    if n <= 0:
-        return False
+    new_text = text[:begin.start()] + preamble + text[begin.start():]
 
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -342,15 +279,7 @@ def _preflight_comment_inputenc_fontenc(work_dir, main_rel):
     except OSError:
         return False
 
-    uses_unicode_stack = any(
-        tok in text
-        for tok in (
-            "\\usepackage{fontspec}",
-            "\\usepackage{xeCJK}",
-            "\\usepackage{luatexja}",
-            "\\usepackage{ctex}",
-        )
-    )
+    uses_unicode_stack = bool(_packages(text) & {"fontspec", "xeCJK", "luatexja", "ctex"})
     if not uses_unicode_stack:
         return False
 
@@ -363,8 +292,8 @@ def _preflight_comment_inputenc_fontenc(work_dir, main_rel):
         return indent + "% " + line[len(indent) :]
 
     for pat in (
-        r"^(?P<indent>\s*)\\usepackage\[[^\]]*\]\{inputenc\}.*$",
-        r"^(?P<indent>\s*)\\usepackage\[[^\]]*\]\{fontenc\}.*$",
+        r"^(?P<indent>\s*)\\usepackage(?:\[[^\]]*\])?\{inputenc\}.*$",
+        r"^(?P<indent>\s*)\\usepackage(?:\[[^\]]*\])?\{fontenc\}.*$",
     ):
         if re.search(pat, text, flags=re.MULTILINE):
             text = re.sub(pat, _comment_line, text, count=1, flags=re.MULTILINE)
@@ -382,7 +311,9 @@ def _preflight_comment_inputenc_fontenc(work_dir, main_rel):
 def _fix_command_already_defined(work_dir, rel_path, cmd):
     # Prefer \renewcommand so the paper's intended macro definition wins.
     # This is safer than \providecommand for math macros commonly redefined in arXiv sources.
-    abs_path = os.path.join(work_dir, rel_path)
+    abs_path = os.path.realpath(os.path.join(work_dir, rel_path))
+    if os.path.commonpath([os.path.realpath(work_dir), abs_path]) != os.path.realpath(work_dir):
+        return False
     try:
         with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
             lines = f.readlines()
@@ -391,7 +322,7 @@ def _fix_command_already_defined(work_dir, rel_path, cmd):
 
     cmd_esc = re.escape(cmd)
     pat1 = re.compile(rf"^\s*\\newcommand\*?\s*\\{cmd_esc}\b")
-    pat2 = re.compile(rf"^\s*\\newcommand\*?\s*\{{\\{cmd_esc}\}}\b")
+    pat2 = re.compile(rf"^\s*\\newcommand\*?\s*\{{\\{cmd_esc}\}}")
 
     changed = False
     for i, line in enumerate(lines):
@@ -413,27 +344,6 @@ def _fix_command_already_defined(work_dir, rel_path, cmd):
     return True
 
 
-def _extract_pdf_text(pdf_path):
-    # Best-effort; used only for unresolved markers detection.
-    try:
-        import pypdf  # type: ignore
-    except Exception:
-        return None
-
-    try:
-        reader = pypdf.PdfReader(pdf_path)
-        return "\n".join((page.extract_text() or "") for page in reader.pages)
-    except Exception:
-        return None
-
-
-def _has_unresolved_markers(pdf_path):
-    text = _extract_pdf_text(pdf_path)
-    if not text:
-        return False
-    return any(m in text for m in _UNRESOLVED_CITE_MARKERS) or any(m in text for m in _UNRESOLVED_REF_MARKERS)
-
-
 def _try_fix_from_logs(work_dir, main_rel, logs_text):
     # Returns True if any fix was applied.
     applied = False
@@ -441,7 +351,7 @@ def _try_fix_from_logs(work_dir, main_rel, logs_text):
     # Fix common macro redefinition errors (e.g. luatexja defines \mc).
     m = _CMD_ALREADY_DEFINED_WITH_PATH_RE.search(logs_text)
     if m:
-        rel = _map_server_path_to_local(m.group("path"), main_rel)
+        rel = m.group("path")
         cmd = m.group("cmd")
         if _fix_command_already_defined(work_dir, rel, cmd):
             applied = True
@@ -457,150 +367,165 @@ def _try_fix_from_logs(work_dir, main_rel, logs_text):
     return applied
 
 
-def _pdf_is_referenced(rel_path, source_texts):
-    rel_path = rel_path.replace("\\", "/")
-    stem_path = os.path.splitext(rel_path)[0]
-    base = os.path.basename(rel_path)
-    base_stem = os.path.splitext(base)[0]
-    keys = tuple(dict.fromkeys((rel_path, stem_path, base, base_stem)))
-
-    for text in source_texts.values():
-        if any(key and key in text for key in keys):
-            return True
-    return False
+def _local_environment():
+    env = os.environ.copy()
+    # The desktop app may have started before MacTeX updated shell paths.
+    env["PATH"] = env.get("PATH", os.defpath) + os.pathsep + "/Library/TeX/texbin"
+    return env
 
 
-def _should_skip_resource(rel_path, source_texts):
-    rel_lower = rel_path.lower()
-    base_lower = os.path.basename(rel_lower)
-
-    if rel_lower.startswith("__macosx/"):
-        return True
-    if base_lower in _SKIP_FILENAMES:
-        return True
-    if rel_lower.endswith(_BUILD_ARTIFACT_EXTS):
-        return True
-    if rel_lower.endswith(".pdf") and not _pdf_is_referenced(rel_path, source_texts):
-        return True
-    return False
+def _require_tool(name, env):
+    tool = shutil.which(name, path=env["PATH"])
+    if not tool:
+        raise RuntimeError(
+            f"Missing local tool: {name}. Install TeX Live (macOS: "
+            "brew install --cask mactex-no-gui), or add its bin directory to PATH."
+        )
+    return tool
 
 
-def compile_online(work_dir, main_tex, output_path):
+def _stage_project(work_dir, destination):
+    def ignore(directory, names):
+        return [name for name in names if name in {
+            _BUILD_DIR, ".git", "__pycache__", "__MACOSX", *_SKIP_FILENAMES
+        } or name.lower().endswith(_BUILD_ARTIFACT_EXTS)]
+
+    # Preserve ALL PDF assets: no heuristic filtering of figures.
+    shutil.copytree(work_dir, destination, ignore=ignore)
+
+
+def _bibliography_option(project, main_rel):
+    """Do not overwrite a prebuilt biblatex .bbl when its .bib is unavailable."""
+    sources = _collect_source_texts(project)
+    text = _uncomment("\n".join(t for p, t in sources.items() if p.endswith(".tex")))
+    if "biblatex" in _packages(text) or "\\addbibresource" in text:
+        names = re.findall(r"\\addbibresource\s*(?:\[[^\]]*\])?\s*\{([^}]+)\}", text)
+        bbl = _find_prebuilt_bbl(project, main_rel)
+        if bbl and any(not (Path(project) / name).is_file() for name in names):
+            # latexmk writes job files at the project root, even for a nested main.
+            target = Path(project) / (Path(main_rel).stem + ".bbl")
+            source = Path(project) / bbl
+            if source != target:
+                shutil.copy2(source, target)
+            return "-bibtex-"
+    return "-bibtex-cond"
+
+
+def _run_latexmk(command, cwd, env, log_path, timeout=_COMPILE_TIMEOUT):
+    with open(log_path, "w", encoding="utf-8") as log:
+        log.write(f"cwd: {cwd}\ncommand: {command!r}\n\n")
+        log.flush()
+        process = subprocess.Popen(
+            command, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=(os.name == "posix"),
+        )
+        try:
+            return process.wait(timeout=timeout)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
+            process.wait()
+            raise
+
+
+def _validate_pdf(pdf_path, engine_log):
+    if not pdf_path.is_file():
+        raise RuntimeError("latexmk did not produce a PDF")
+    with pdf_path.open("rb") as pdf:
+        if pdf.read(5) != b"%PDF-":
+            raise RuntimeError("Compiler output is not a PDF")
+        pdf.seek(max(0, pdf_path.stat().st_size - 1024))
+        if b"%%EOF" not in pdf.read():
+            raise RuntimeError("Compiler output is an incomplete PDF")
+    if not engine_log.is_file():
+        raise RuntimeError("Missing final LaTeX log; cannot validate references")
+    text = _read_text(engine_log)
+    if _UNRESOLVED_LOG_RE.search(text):
+        raise RuntimeError("Unresolved citations/references in final LaTeX log")
+    if "Missing character:" in text:
+        raise RuntimeError("Missing glyphs in final LaTeX log; check the selected fonts")
+
+
+def _publish_pdf(source, output):
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # Same-filesystem atomic replacement keeps an existing PDF intact on failure.
+    fd, pending = tempfile.mkstemp(prefix=".arxiv-pdf-", suffix=".pdf", dir=output.parent)
+    os.close(fd)
+    try:
+        shutil.copyfile(source, pending)
+        os.replace(pending, output)
+    finally:
+        if os.path.exists(pending):
+            os.unlink(pending)
+
+
+def compile_local(work_dir, main_tex, output_path):
     work_dir, main_rel = _main_tex_relative(work_dir, main_tex)
     output_path = _resolve_output_pdf(output_path, main_rel)
+    if Path(output_path).suffix.lower() != ".pdf":
+        raise ValueError("output_pdf_path must end in .pdf (or be a directory)")
+    env = _local_environment()
+    latexmk = _require_tool("latexmk", env)
     compiler = _detect_compiler(work_dir, main_rel)
+    _require_tool(compiler, env)
 
-    bbl_inlined = False
-
-    def _build_resources():
-        # Rebuild every attempt so retries include any auto-fixes applied to source files.
-        source_texts = _collect_source_texts(work_dir)
-        resources = []
-        main_marked = False
-        for fpath, rel_cmp in _iter_project_files(work_dir):
-            if _should_skip_resource(rel_cmp, source_texts):
-                continue
-            item = {"path": rel_cmp, "file": encode(fpath)}
-            if rel_cmp == main_rel:
-                item["main"] = True
-                main_marked = True
-            resources.append(item)
-        if not main_marked:
-            print(
-                "Error: main file not found under work_dir; cannot set main.\n"
-                f"  expected relative path: {main_rel!r}\n"
-                f"  work_dir: {work_dir}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        return resources
-
-    max_attempts = 3  # 1 initial + up to 2 auto-fix retries
-    last_error = None
-
-    for attempt in range(1, max_attempts + 1):
-        bbl_inlined = _inline_prebuilt_bbl(work_dir, main_rel) or bbl_inlined
+    build_parent = Path(work_dir) / _BUILD_DIR
+    build_parent.mkdir(exist_ok=True)
+    # Keep first-run font caches writable in sandboxed desktop sessions, too.
+    env.setdefault("TEXMFVAR", str(build_parent / "texmf-var"))
+    env.setdefault("TEXMFCACHE", env["TEXMFVAR"])
+    build = Path(tempfile.mkdtemp(prefix="run-", dir=build_parent))
+    print(f"Build directory: {build}", file=sys.stderr, flush=True)
+    for attempt in range(1, 4):
+        _inline_prebuilt_bbl(work_dir, main_rel)
         _ensure_cjk_support(work_dir, main_rel)
-        # Preflight source tweaks that are almost always needed for Unicode stacks.
         _preflight_comment_inputenc_fontenc(work_dir, main_rel)
-        resources = _build_resources()
-
-        payload = {
-            "compiler": compiler,
-            "resources": resources,
-            "options": {
-                "compiler": {"halt_on_error": True, "silent": True},
-                "response": {"log_files_on_failure": True},
-            },
-        }
-        if bbl_inlined:
-            payload["options"]["compiler"]["bibliography"] = False
-
-        resp = requests.post(
-            "https://latex.ytotech.com/builds/sync",
-            json=payload,
-            timeout=300,
-        )
-
-        if 200 <= resp.status_code < 300 and resp.content.startswith(b"%PDF"):
-            with open(output_path, "wb") as f:
-                f.write(resp.content)
-
-            # Extra guard: catch "successful" PDFs that still contain unresolved
-            # citations/references due to earlier errors or incomplete runs.
-            if _has_unresolved_markers(output_path):
-                last_error = "PDF contains unresolved markers (e.g. '??' or '[?]')."
-                if attempt < max_attempts:
-                    continue
-                print(f"Compilation failed: {last_error}", file=sys.stderr)
-                sys.exit(1)
-
-            print(f"✅ Wrote PDF: {os.path.abspath(output_path)}")
+        project = build / f"attempt-{attempt}"
+        _stage_project(work_dir, project)
+        pdf = project / (Path(main_rel).stem + ".pdf")
+        # Copied historical output must never be mistaken for a fresh build.
+        if pdf.exists():
+            pdf.unlink()
+        log = build / f"attempt-{attempt}.log"
+        engine_log = project / (Path(main_rel).stem + ".log")
+        command = [
+            latexmk, "-norc", f"-{compiler}", "-interaction=nonstopmode",
+            "-halt-on-error", "-file-line-error", "-no-shell-escape",
+            _bibliography_option(str(project), main_rel), "./" + main_rel,
+        ]
+        print(f"Local {compiler}, attempt {attempt}/3; log: {log}", file=sys.stderr, flush=True)
+        try:
+            code = _run_latexmk(command, str(project), env, str(log))
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Compilation timed out after {_COMPILE_TIMEOUT}s. Log: {log}") from None
+        logs_text = _read_text(log).replace(str(project) + os.sep, "./")
+        if code == 0:
+            try:
+                _validate_pdf(pdf, engine_log)
+            except RuntimeError as error:
+                raise RuntimeError(f"{error}. Logs: {log}, {engine_log}") from error
+            _publish_pdf(pdf, output_path)
+            print(f"✅ Wrote PDF: {output_path}")
             return True
-
-        # Failure: try to parse logs (JSON error payload) and apply targeted fixes.
-        logs_text = ""
-        try:
-            if resp.headers.get("Content-Type", "").startswith("application/json"):
-                data = resp.json()
-                if isinstance(data, dict):
-                    log_files = data.get("log_files") or {}
-                    if isinstance(log_files, dict):
-                        logs_text = log_files.get("__main_document__.log") or data.get("logs") or ""
-        except Exception:
-            logs_text = ""
-
-        snippet = resp.content[:4000]
-        try:
-            msg = snippet.decode("utf-8", errors="replace")
-        except Exception:
-            msg = repr(snippet[:500])
-
-        last_error = f"HTTP {resp.status_code}: {msg if msg.strip() else '(non-text response, truncated)'}"
-        if logs_text:
-            if attempt < max_attempts and _try_fix_from_logs(work_dir, main_rel, logs_text):
-                # retry after applying fix
-                continue
-
-        # No fix applied or out of attempts.
-        print("Compilation failed (attempt %d/%d)." % (attempt, max_attempts), file=sys.stderr)
-        print(last_error, file=sys.stderr)
-        if logs_text:
-            print("\n--- compiler log (truncated) ---", file=sys.stderr)
-            print(logs_text[-8000:], file=sys.stderr)
-        sys.exit(1)
-
-    print("Compilation failed.", file=sys.stderr)
-    if last_error:
-        print(last_error, file=sys.stderr)
-    sys.exit(1)
+        if attempt < 3 and _try_fix_from_logs(work_dir, main_rel, logs_text):
+            continue
+        print(logs_text[-8000:], file=sys.stderr)
+        raise RuntimeError(f"Compilation failed (exit {code}, attempt {attempt}/3). Full log: {log}")
+    return False
 
 
 if __name__ == "__main__":
     if len(sys.argv) != 4:
-        print(
-            "Usage: python compile.py <work_dir> <main_tex> <output_pdf_path>",
-            file=sys.stderr,
-        )
+        print("Usage: python compile.py <work_dir> <main_tex> <output_pdf_path>", file=sys.stderr)
         sys.exit(2)
-    compile_online(sys.argv[1], sys.argv[2], sys.argv[3])
+    try:
+        compile_local(sys.argv[1], sys.argv[2], sys.argv[3])
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"Compilation failed: {error}", file=sys.stderr)
+        sys.exit(1)

@@ -24,9 +24,43 @@ Skill 会引导 Agent：
 1. 拉取 arXiv LaTeX；无源码则说明并跳过。
 2. 翻译正文，公式、引用、标签、图表路径与常用学术英文词保留不译。
 3. 主文件 `\begin{document}` 前插入编译所需库与中文支持，并复用 arXiv 源码自带的 `.bbl` 以保证引用可解析。
-4. `scripts/compile.py` 提交在线 LuaLaTeX 编译，生成 PDF。编译成功后默认保留 `.tmp_arxiv` 工作目录，便于检查 PDF 后继续微调；确认无误后可再调用 `cleanup.py` 清理。
+4. `scripts/compile.py` 调用本地 `latexmk` 和 LuaLaTeX（已有 xeCJK 配置时使用 XeLaTeX），自动完成多轮编译并生成 PDF。编译成功后默认保留 `.tmp_arxiv` 工作目录，便于检查 PDF 后继续微调；确认无误后可再调用 `cleanup.py` 清理。
 
-本地仅需：Python 3 与 `requests`（`pip install requests`）。无需在本地配置任何 LaTeX 编译环境。
+本地需要 Python 3.9+ 和完整 TeX Live 环境，Python 脚本不需要 `requests`。编译完全在本机进行，不上传源码，也不会回退到远程服务；论文检索、源码下载仍需要联网。
+
+### 配置本地编译环境
+
+macOS 安装完整编译环境：
+
+```bash
+brew install --cask mactex-no-gui
+```
+
+安装完成后可重新打开终端，或直接验证：
+
+```bash
+/Library/TeX/texbin/latexmk -v
+/Library/TeX/texbin/lualatex --version
+/Library/TeX/texbin/xelatex --version
+/Library/TeX/texbin/bibtex --version
+/Library/TeX/texbin/biber --version
+/Library/TeX/texbin/kpsewhich luatexja-fontspec.sty
+/Library/TeX/texbin/kpsewhich FandolSong-Regular.otf
+```
+
+脚本优先查找 PATH，也会自动查找 `/Library/TeX/texbin`。其他系统安装完整 TeX Live，并把其可执行文件目录加入 PATH。
+
+调用方式保持不变：
+
+```bash
+python3 arxiv-translator/scripts/compile.py "$WORK_DIR" "$MAIN_TEX" "$OUTPUT_DIR/$PDF_NAME.pdf"
+```
+
+`MAIN_TEX` 是相对 `WORK_DIR` 的路径，也可以是其内部的绝对路径；源码中的图片、章节路径以 `WORK_DIR` 为基准。输出参数可指定 PDF 文件或已有目录，也可用末尾 `/` 表示待创建的目录。支持中文和空格路径。
+
+脚本在 `$WORK_DIR/.arxiv-build/run-*/attempt-*` 中构建源码副本，完整控制台日志保存在对应的 `attempt-*.log`，TeX 日志在构建副本内。每次运行最多 300 秒，明确可修复的宏重复定义错误最多自动重试两次。成功后检查 PDF 完整性、最终日志中的未解析引用和缺字，再原子替换目标 PDF；失败保留已有 PDF、源码和日志。
+
+自动添加的中文配置使用 TeX Live 自带的 Fandol 字体；已有中文配置予以保留。普通 BibTeX 文档优先复用源码自带 `.bbl`；没有预置文献时由 `latexmk` 调用 BibTeX/Biber。出错时参考 `arxiv-translator/references/compile-errors.md`。构建不加载 latexmk 配置文件，并关闭 shell escape；需要特殊外部工具的论文应先准备好对应资源。
 
 
 ## 安装方式 💻 
@@ -66,7 +100,7 @@ Skill 会引导 Agent：
 | 翻译粒度 | 常按页切块，和章节结构脱节 | 按标题、摘要、正文等结构译，细则见 `SKILL.md` |
 | 上下文与译文质量 | 切块输入，语境窄，术语与指代易不一致 | 能利用更大上下文，论证与术语更易统一 |
 | 可复核性 | 难按原结构改 | 产出 `.tex`，方便 diff 与局部重译 |
-| 依赖环境 | 各家工具形态不一 | 编译走在线 HTTP API，免本地 LaTeX |
+| 依赖环境 | 各家工具形态不一 | Python 3 与本地 TeX Live；源码无需上传编译服务 |
 
 当然，本 Skill 也有限制：仅适用于 arXiv 上提供 LaTeX 源码的稿件；纯 PDF 投稿则无法沿用同一流程。
 
@@ -78,15 +112,19 @@ arxiv-translator/
 ├── scripts/
 │   ├── download.py          # 按 arXiv ID 下载 e-print 并解压到工作目录
 │   ├── inspect_tex.py       # 扫描正文中可能未翻译的英文片段（辅助检查）
-│   ├── compile.py           # 将工作目录打包提交在线编译，写出 PDF
+│   ├── compile.py           # 使用本地 latexmk 多轮编译，验证并写出 PDF
 │   └── cleanup.py           # 删除 .tmp_arxiv 工作目录；可选先备份翻译后的 .tex/.bbl
 └── references/
     └── compile-errors.md    # 编译失败时的排查参考
 ```
 
+## 开发验证
+
+在仓库根目录运行 `python3 -m unittest discover -s tests -v`。回归测试不需要 TeX；真实编译测试在缺少 `latexmk` 时跳过，安装后会验证中文、图片、交叉引用、BibTeX/Biber 和 XeLaTeX。设置 `ARXIV_TEST_OUTPUT_DIR` 可保留真实测试的 PDF 与日志，便于渲染检查。
+
 ## 致谢 🙏
 
-在线编译依赖 [LaTeX-On-HTTP](https://github.com/YtoTech/latex-on-http) 提供的 HTTP 编译能力。本 Skill 中的 `compile.py` 通过其公共服务 `https://latex.ytotech.com/builds/sync` 提交工程，由服务端完成 LuaLaTeX 编译，省去了在本地安装与维护完整 LaTeX 环境的成本。若你在科研或工作中受益，也欢迎去了解、反馈或参与该上游项目。
+本地编译依赖 [TeX Live](https://tug.org/texlive/)、[MacTeX](https://tug.org/mactex/) 和 [latexmk](https://ctan.org/pkg/latexmk)。感谢这些项目提供的排版引擎、宏包与自动编译工具。
 
 ---
 

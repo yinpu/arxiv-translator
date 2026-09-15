@@ -73,6 +73,8 @@ python3 {SKILL_DIR}/scripts/inspect_tex.py scan "$WORK_DIR" "$MAIN_TEX" full
 
 ## 第四步：编译与清理
 
+编译只使用本地 TeX Live，禁止上传源码到编译服务或回退到远程编译。需要 `latexmk`、LuaLaTeX/XeLaTeX 和相应的文献工具；macOS 可通过 `brew install --cask mactex-no-gui` 安装。环境缺失时明确报告缺少的工具及安装方法，不要重复修改论文来解决环境问题。
+
 编译：
 
 ```bash
@@ -80,12 +82,16 @@ python3 {SKILL_DIR}/scripts/compile.py "$WORK_DIR" "$MAIN_TEX" "$OUTPUT_DIR/$PDF
 ```
 
 `compile.py` 会统一完成以下编译前处理：
-- 若检测到中文且主文件尚无 CJK 支持，自动在主文件 preamble 中补入 LuaLaTeX 所需中文支持；
+- 若检测到中文且主文件尚无 CJK 支持，自动在主文件 preamble 中补入 LuaLaTeX 所需中文支持，使用 TeX Live 自带的 Fandol 字体；已有中文配置保持不变；
 - 自动注释掉与 Unicode 编译栈冲突的 `fontenc` / `inputenc`；
-- 若源码自带 `.bbl`，自动将其内联到 `\bibliography{...}` 位置，避免远端单遍编译后引用显示为 `?`；
-- 自动忽略常见编译中间文件与未被源码引用的游离 PDF，避免把无关产物上传到远端编译服务。
+- 普通 BibTeX 文档若自带 `.bbl`，自动将其内联到 `\bibliography{...}` 位置；其余情况由 `latexmk` 管理 BibTeX/Biber，缺少 `.bib` 时保护预置 `.bbl`；
+- 在 `$WORK_DIR/.arxiv-build/run-*/attempt-*` 中编译源码副本，保留所有 PDF 图片资源，以 `WORK_DIR` 为相对路径基准；
+- 默认调用 LuaLaTeX，已有 xeCJK 配置时调用 XeLaTeX，自动多轮编译解析引用；
+- 完整控制台日志写入构建目录的 `attempt-*.log`，TeX 日志保存在源码副本中；单次编译超时为 300 秒；
+- 检查 PDF 完整性以及最终日志中的未解析引用、缺字，全部通过后才替换目标 PDF，失败时保留旧 PDF；
+- 不加载 latexmk 配置文件，关闭 shell escape；对依赖外部工具的模板先准备对应资源，不自动放开执行权限。
 
-编译失败时：读取 stderr 中的错误日志，参考 `references/compile-errors.md` 修复源码，重新编译（最多重试 2 次）。
+编译失败时：读取 stderr 指出的本地日志，参考 `references/compile-errors.md` 修复源码。脚本对明确的宏重复定义最多自动重试 2 次；不要再套一层通用重试。其他源码错误修复后最多人工重试 2 次；缺少工具、字体或宏包时先处理依赖。
 
 编译成功后默认保留 `$OUTPUT_DIR/.tmp_arxiv`，方便用户检查 PDF 后继续微调翻译源码。只有用户明确要求清理、或你已经完成必要检查且确认不再需要源码时，才调用：
 

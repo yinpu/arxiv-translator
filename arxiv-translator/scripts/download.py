@@ -59,7 +59,8 @@ def download_and_extract(paper_id, work_dir):
     os.remove(source_path)
 
     tex_files = []
-    for root, _, files in os.walk(work_dir):
+    for root, dirs, files in os.walk(work_dir):
+        dirs[:] = [name for name in dirs if name != ".arxiv-build"]
         for f in files:
             if f.endswith(".tex"):
                 tex_files.append(os.path.relpath(os.path.join(root, f), work_dir))
