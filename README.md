@@ -1,11 +1,15 @@
-## 为什么开发 arXiv-translator Skill 🤔
+# arxiv-translator · 本地编译版
 
-新论文层出不穷，英文读得再顺也不如母语省心；我们想把这些论文变成排版规范、读着顺口的中文 PDF。
+将 arXiv 论文的 LaTeX 源码翻译为中文，并在本机编译成 PDF。
 
-依托 CS 领域最常用的 arXiv 平台，我们编写了一个从 LaTeX 源码进行翻译并编译的 Skill，可在一键安装 Skill 后，直接告诉它想读什么论文，几分钟后，一篇排版清晰、语言易读的论文便呈现在你面前。
+本仓库由 [yinpu](https://github.com/yinpu) 维护，项目地址为 [yinpu/arxiv-translator](https://github.com/yinpu/arxiv-translator)。在原有论文翻译流程上，本版本改为使用本地 TeX Live 编译：
 
-> *本Skill采用中文进行开发，目的是为了进一步降低阅读门槛，同时也借这个例子说明：网上常被提到的 Skill，拆开来看并不神秘，本质上是把领域流程、约束和工具调用方式写进一份结构化说明里，相当于 Prompt 与工作流的整合与进阶，而非黑盒魔法。*
+- 使用 `latexmk` 管理 LuaLaTeX/XeLaTeX 和参考文献的多轮编译。
+- 编译时不上传源码，不回退到远程服务。
+- 自动添加的中文配置使用 TeX Live 自带字体。
+- 编译失败保留已有 PDF，完整日志和工作目录便于继续修订。
 
+Skill 的工作流程与翻译规则见 [SKILL.md](arxiv-translator/SKILL.md)。
 
 ## 这个 Skill 是做什么的？ 🔧 
 
@@ -65,12 +69,13 @@ python3 arxiv-translator/scripts/compile.py "$WORK_DIR" "$MAIN_TEX" "$OUTPUT_DIR
 
 ## 安装方式 💻 
 
-安装方式千千万，这里推荐最稳妥、对网络和权限要求最低的安装流程。
+先按上文配置本地编译环境，再安装 Skill。
 
 1. Clone 本仓库：
 
    ```bash
-   git clone https://github.com/Leey21/arxiv-translator
+   git clone https://github.com/yinpu/arxiv-translator.git
+   cd arxiv-translator
    ```
 
    注：若 Git 不可用，可直接下载压缩包解压。
@@ -81,9 +86,11 @@ python3 arxiv-translator/scripts/compile.py "$WORK_DIR" "$MAIN_TEX" "$OUTPUT_DIR
    路径 `<path>` 中定义了一个 Skill，请你阅读并将其安装到你的 skills 目录下。
    ```
    
-   注：将 `<path>` 替换为你克隆后的项目路径，即本仓库里 `arxiv-translator` 目录的绝对路径。
+   注：将 `<path>` 替换为仓库内包含 `SKILL.md` 的子目录绝对路径，即 `<仓库路径>/arxiv-translator`。
 
-以Codex为例，安装过程如下：
+以下安装与排版截图沿用自上游项目，展示 Skill 的使用方式和译文效果；本版本的编译方式以上文的本地编译说明为准。
+
+以 Codex 为例，安装过程如下：
 
 ![Codex 安装示例](images/Install_Examples-Codex.png)
 
@@ -97,7 +104,7 @@ python3 arxiv-translator/scripts/compile.py "$WORK_DIR" "$MAIN_TEX" "$OUTPUT_DIR
 | 维度 | 直接翻译 PDF | 本 Skill（LaTeX 源码路径） |
 |------|----------------|-----------------------------|
 | 版面与公式 | 整页/OCR 易乱版，公式与多栏易坏 | 在源码里保留数学与引用，再编译成正常 PDF |
-| 翻译粒度 | 常按页切块，和章节结构脱节 | 按标题、摘要、正文等结构译，细则见 `SKILL.md` |
+| 翻译粒度 | 常按页切块，和章节结构脱节 | 按标题、摘要、正文等结构译，细则见 [SKILL.md](arxiv-translator/SKILL.md) |
 | 上下文与译文质量 | 切块输入，语境窄，术语与指代易不一致 | 能利用更大上下文，论证与术语更易统一 |
 | 可复核性 | 难按原结构改 | 产出 `.tex`，方便 diff 与局部重译 |
 | 依赖环境 | 各家工具形态不一 | Python 3 与本地 TeX Live；源码无需上传编译服务 |
@@ -108,24 +115,31 @@ python3 arxiv-translator/scripts/compile.py "$WORK_DIR" "$MAIN_TEX" "$OUTPUT_DIR
 
 ```
 arxiv-translator/
-├── SKILL.md                 # Skill 主说明（Agent 实际读取的核心内容）
-├── scripts/
-│   ├── download.py          # 按 arXiv ID 下载 e-print 并解压到工作目录
-│   ├── inspect_tex.py       # 扫描正文中可能未翻译的英文片段（辅助检查）
-│   ├── compile.py           # 使用本地 latexmk 多轮编译，验证并写出 PDF
-│   └── cleanup.py           # 删除 .tmp_arxiv 工作目录；可选先备份翻译后的 .tex/.bbl
-└── references/
-    └── compile-errors.md    # 编译失败时的排查参考
+├── README.md
+├── LICENSE
+├── arxiv-translator/        # 安装此目录作为 Skill
+│   ├── SKILL.md             # Agent 实际读取的工作流程与翻译规则
+│   ├── scripts/
+│   │   ├── download.py      # 按 arXiv ID 下载源码并解压
+│   │   ├── inspect_tex.py   # 检查可能未翻译的英文片段
+│   │   ├── compile.py       # 本地多轮编译，验证并写出 PDF
+│   │   └── cleanup.py       # 清理工作目录，可选备份 .tex/.bbl
+│   └── references/
+│       └── compile-errors.md
+├── tests/                   # 回归测试与真实编译测试
+└── images/                  # 上游项目的安装与译文示例截图
 ```
 
 ## 开发验证
 
 在仓库根目录运行 `python3 -m unittest discover -s tests -v`。回归测试不需要 TeX；真实编译测试在缺少 `latexmk` 时跳过，安装后会验证中文、图片、交叉引用、BibTeX/Biber 和 XeLaTeX。设置 `ARXIV_TEST_OUTPUT_DIR` 可保留真实测试的 PDF 与日志，便于渲染检查。
 
-## 致谢 🙏
+## 来源与致谢
+
+本项目基于 [Leey21/arxiv-translator](https://github.com/Leey21/arxiv-translator) 改进，沿用了上游的论文翻译流程与示例截图。感谢原作者的工作。本仓库使用 [MIT License](LICENSE)，保留上游版权声明。
 
 本地编译依赖 [TeX Live](https://tug.org/texlive/)、[MacTeX](https://tug.org/mactex/) 和 [latexmk](https://ctan.org/pkg/latexmk)。感谢这些项目提供的排版引擎、宏包与自动编译工具。
 
 ---
 
-如有问题或改进建议，欢迎在 Issues 中讨论 💬
+如有问题或改进建议，欢迎前往 [yinpu/arxiv-translator 的 Issues](https://github.com/yinpu/arxiv-translator/issues) 反馈。
